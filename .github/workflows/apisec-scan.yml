@@ -1,0 +1,124 @@
+name: APIsec Surface org scan
+
+# Trigger only. The scan logic is the apisec-orgscan pip package; this file
+# installs it and calls its commands. GitHub keeps what Python cannot do:
+# the matrix fan-out, runner selection and artifact storage.
+#
+# Secrets:   APISEC_TOKEN (required), ORG_READ_TOKEN (recommended)
+# Variables: APISEC_ENDPOINT (required); optional: APISEC_RUN_PROFILE,
+#            APISEC_LLM_ENRICHMENT, THROUGHPUT, ORCHESTRATOR_RUNNER,
+#            TARGET_ORG, EXCLUDE_REPOS, APISEC_CLI_VERSION, ORGSCAN_VERSION
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:         {description: 'Analyze but do not upload', type: boolean, default: false}
+      force_full_scan: {description: 'Ignore the change cache', type: boolean, default: false}
+      max_repos:       {description: 'Cap repos per run (0 = no cap)', type: string, default: '0'}
+      throughput:      {description: 'Max parallel scans (0 = org variable)', type: string, default: '0'}
+      runner:          {description: 'github-hosted | self-hosted (blank = org variable)', type: string, default: ''}
+      run_profile:     {description: 'surface | legacy (blank = org variable)', type: string, default: ''}
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # POC installs from the git tag; on PyPI this becomes "apisec-orgscan==<version>".
+  ORGSCAN_PKG: git+https://github.com/apisec-inc/poc-surface-orgscan@${{ vars.ORGSCAN_VERSION || 'v1' }}
+
+concurrency: {group: apisec-surface-org-scan, cancel-in-progress: false}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      count:       ${{ steps.plan.outputs.count }}
+      matrix:      ${{ steps.plan.outputs.matrix }}
+      runner_json: ${{ steps.plan.outputs.runner_json }}
+      run_profile: ${{ steps.plan.outputs.run_profile }}
+      enrichment:  ${{ steps.plan.outputs.enrichment }}
+      cli_version: ${{ steps.plan.outputs.cli_version }}
+      throughput:  ${{ steps.plan.outputs.throughput }}
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install --quiet "$ORGSCAN_PKG"
+      - id: plan
+        env:
+          GITHUB_TOKEN:    ${{ github.token }}
+          GH_TOKEN:        ${{ secrets.ORG_READ_TOKEN || github.token }}
+          GITHUB_ORG:      ${{ vars.TARGET_ORG || github.repository_owner }}
+          FORCE_FULL_SCAN: ${{ inputs.force_full_scan || 'false' }}
+          MAX_REPOS:       ${{ inputs.max_repos || '0' }}
+          EXCLUDE_REPOS:   ${{ vars.EXCLUDE_REPOS }}
+          CACHE_PATH:      .cache/push-ts-store.json
+          IN_RUNNER:       ${{ inputs.runner }}
+          IN_RUN_PROFILE:  ${{ inputs.run_profile }}
+          IN_THROUGHPUT:   ${{ inputs.throughput }}
+        run: |
+          apisec-orgscan restore
+          apisec-orgscan plan
+
+  scan:
+    needs: plan
+    if: needs.plan.outputs.count != '' && needs.plan.outputs.count != '0'
+    runs-on: ${{ fromJSON(needs.plan.outputs.runner_json) }}
+    timeout-minutes: 45
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+      max-parallel: ${{ fromJson(needs.plan.outputs.throughput) }}
+      fail-fast: false
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: |
+          pip install --quiet "$ORGSCAN_PKG" "apisec-surface==${{ needs.plan.outputs.cli_version }}"
+          apisec-surface telemetry off || true
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo_full_name }}
+          token:      ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path:       repos/${{ matrix.repo_name }}
+          fetch-depth: 1
+      - id: scan
+        env:
+          REPO_NAME: ${{ matrix.repo_name }}
+          REPO_ID:   ${{ matrix.repo_id }}
+          PROFILE:   ${{ needs.plan.outputs.run_profile }}
+          ENRICH:    ${{ needs.plan.outputs.enrichment }}
+          API_URL:   ${{ vars.APISEC_ENDPOINT }}
+          TOKEN:     ${{ secrets.APISEC_TOKEN }}
+          DRY_RUN:   ${{ inputs.dry_run }}
+        run: |
+          ARGS=(scan "repos/$REPO_NAME" --repo-id "$REPO_ID" --run-profile "$PROFILE" --enrichment "$ENRICH" --api-url "$API_URL" --token "$TOKEN")
+          [ "$DRY_RUN" = "true" ] && ARGS+=(--dry-run)
+          apisec-orgscan "${ARGS[@]}"
+        continue-on-error: true
+      - if: steps.scan.outcome == 'success' && inputs.dry_run != true
+        run: apisec-orgscan record --repo-id "${{ matrix.repo_id }}" --pushed-at "${{ matrix.pushed_at }}"
+      - if: steps.scan.outcome == 'success' && inputs.dry_run != true
+        uses: actions/upload-artifact@v4
+        with: {name: "ts-update-${{ matrix.repo_id }}", path: "ts-updates/${{ matrix.repo_id }}.json", retention-days: 1}
+
+  update-store:
+    needs: [plan, scan]
+    if: always() && inputs.dry_run != true && needs.plan.outputs.count != '' && needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install --quiet "$ORGSCAN_PKG"
+      - uses: actions/download-artifact@v4
+        with: {pattern: "ts-update-*", path: ts-updates, merge-multiple: true}
+        continue-on-error: true
+      - env: {GITHUB_TOKEN: "${{ github.token }}"}
+        run: |
+          apisec-orgscan restore
+          apisec-orgscan merge
+      - uses: actions/upload-artifact@v4
+        with: {name: push-ts-store, path: .cache/push-ts-store.json, retention-days: 90, overwrite: true}
